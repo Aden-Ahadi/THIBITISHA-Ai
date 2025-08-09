@@ -15,8 +15,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+# Manually load .env file
+with open(".env") as f:
+    for line in f:
+        line = line.strip()
+        if line and not line.startswith("#"):
+            key, value = line.split("=", 1)
+            os.environ[key] = value
+
 # Bot configuration
-BOT_TOKEN = "7572597201:AAFlpQXhFta2EEzkdSC15sBG3BYiosOBbtw"
+BOT_TOKEN =os.environ.get("TELEGRAM_TOKEN")
 
 class HuggingFaceAIDetector:
     def __init__(self):
