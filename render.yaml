@@ -1,9 +1,16 @@
 services:
   - type: web
-    name: telegram-ai-bot
+    name: thibitisha-ai-bot
     env: python
+    region: oregon
+    plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python clean_ai_bot.py
+    startCommand: python telegram_bot.py
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false
+      - key: PYTHON_VERSION
+        value: 3.11.0
+    scaling:
+      minInstances: 1
+      maxInstances: 1

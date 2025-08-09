@@ -5,3 +5,4 @@ torchvision==0.16.0
 pillow==10.0.1
 requests==2.31.0
 huggingface-hub==0.18.0
+accelerate==0.24.0
