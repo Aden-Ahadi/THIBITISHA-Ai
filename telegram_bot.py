@@ -7,6 +7,8 @@ from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, fil
 from transformers import pipeline
 from PIL import Image
 import asyncio
+import tempfile
+import time
 
 # Set up logging
 logging.basicConfig(
@@ -15,17 +17,24 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Environment variable handling with fallback
+def load_env():
+    """Load environment variables from .env file if it exists"""
+    env_file = ".env"
+    if os.path.exists(env_file):
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, value = line.split("=", 1)
+                    os.environ[key] = value.strip('"\'')
 
-# Manually load .env file
-with open(".env") as f:
-    for line in f:
-        line = line.strip()
-        if line and not line.startswith("#"):
-            key, value = line.split("=", 1)
-            os.environ[key] = value
+load_env()
 
 # Bot configuration
-BOT_TOKEN =os.environ.get("TELEGRAM_TOKEN")
+BOT_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+if not BOT_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN environment variable is required!")
 
 class HuggingFaceAIDetector:
     def __init__(self):
@@ -45,11 +54,12 @@ class HuggingFaceAIDetector:
             try:
                 logger.info(f"Trying to load model: {model_name}")
                 
+                # Set device to CPU for better compatibility on cloud platforms
                 self.classifier = pipeline(
                     "image-classification",
                     model=model_name,
+                    device="cpu",  # Force CPU usage
                     trust_remote_code=True,
-                    use_fast=True
                 )
                 
                 self.model_name = model_name
@@ -63,7 +73,7 @@ class HuggingFaceAIDetector:
         logger.error("❌ All models failed to load. Bot will use dummy responses.")
         return False
     
-    def classify_image(self, image_path: str) -> Dict[str, float]:
+    def classify_image(self, image_path: str) -> Dict:
         """Classify if an image is AI-generated"""
         if self.classifier is None:
             logger.warning("No model available - returning dummy result")
@@ -78,24 +88,27 @@ class HuggingFaceAIDetector:
             image = Image.open(image_path).convert('RGB')
             
             # Resize if too large (helps with memory and speed)
-            max_size = 1024
+            max_size = 512  # Reduced size for better performance on limited resources
             if max(image.size) > max_size:
                 image.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
             
             logger.info(f"Processing image with model: {self.model_name}")
             
-            # Run classification
+            # Run classification with timeout handling
+            start_time = time.time()
             results = self.classifier(image)
+            processing_time = time.time() - start_time
             
             # Extract AI probability based on model type
             ai_probability = self._extract_ai_probability(results)
             
-            logger.info(f"Classification results: {results}")
+            logger.info(f"Classification completed in {processing_time:.2f}s")
             logger.info(f"Final AI probability: {ai_probability:.3f}")
             
             return {
                 "ai_probability": float(ai_probability),
                 "model_used": self.model_name,
+                "processing_time": processing_time,
                 "raw_results": results
             }
             
@@ -104,7 +117,7 @@ class HuggingFaceAIDetector:
             return {
                 "ai_probability": 0.5, 
                 "error": str(e),
-                "model_used": self.model_name
+                "model_used": self.model_name or "unknown"
             }
     
     def _extract_ai_probability(self, results) -> float:
@@ -113,8 +126,8 @@ class HuggingFaceAIDetector:
             return 0.5
         
         # Handle different model output formats
-        ai_keywords = ['artificial', 'ai', 'generated', 'fake', 'synthetic', 'artificial intelligence']
-        real_keywords = ['real', 'human', 'authentic', 'natural', 'photo', 'photograph']
+        ai_keywords = ['artificial', 'ai', 'generated', 'fake', 'synthetic', 'artificial intelligence', 'machine']
+        real_keywords = ['real', 'human', 'authentic', 'natural', 'photo', 'photograph', 'camera']
         
         for result in results:
             label = result['label'].lower()
@@ -136,6 +149,7 @@ class HuggingFaceAIDetector:
 detector = HuggingFaceAIDetector()
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command"""
     model_status = "🟢 Ready" if detector.classifier else "🔴 Limited (No AI model)"
     
     welcome_text = (
@@ -144,35 +158,62 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"**Status:** {model_status}\n"
         f"**Model:** {detector.model_name or 'None'}\n\n"
         "📸 Just send me an image to get started!\n"
-        "💡 Use /info for more details"
+        "💡 Use /info for more details\n"
+        "🔧 Use /status to check bot health"
     )
     await update.message.reply_text(welcome_text, parse_mode='Markdown')
 
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /status command"""
+    status_text = (
+        "🔧 **Bot Status**\n\n"
+        f"**Model Status:** {'🟢 Loaded' if detector.classifier else '🔴 Not Available'}\n"
+        f"**Model Name:** {detector.model_name or 'None'}\n"
+        f"**Python Version:** {os.sys.version.split()[0]}\n"
+        f"**Platform:** Hugging Face Transformers\n\n"
+        "**Memory Usage:** Optimized for cloud deployment\n"
+        "**Processing:** CPU-based inference\n\n"
+        "Ready to analyze images! 📸"
+    )
+    await update.message.reply_text(status_text, parse_mode='Markdown')
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    image_path = None
+    """Handle photo messages"""
+    temp_file = None
     try:
         # Send typing indicator
         await context.bot.send_chat_action(chat_id=update.effective_chat.id, action='typing')
         
         # Download image
-        photo = update.message.photo[-1]  
+        photo = update.message.photo[-1]  # Get highest resolution
         file = await context.bot.get_file(photo.file_id)
-        image_path = f"temp_{photo.file_id}.jpg"
+        
+        # Create temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as temp_file:
+            temp_path = temp_file.name
         
         await update.message.reply_text("📥 Downloading image...")
         
-        # Download with timeout
-        response = requests.get(file.file_path, timeout=30)
-        response.raise_for_status()
+        # Download with timeout and retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = requests.get(file.file_path, timeout=30)
+                response.raise_for_status()
+                break
+            except requests.RequestException as e:
+                if attempt == max_retries - 1:
+                    raise e
+                await asyncio.sleep(2)  # Wait before retry
         
         # Save image
-        with open(image_path, "wb") as f:
+        with open(temp_path, "wb") as f:
             f.write(response.content)
         
         await update.message.reply_text("🧠 Running AI detection...")
         
         # Classify image
-        result = detector.classify_image(image_path)
+        result = detector.classify_image(temp_path)
         
         # Handle errors
         if "error" in result:
@@ -182,13 +223,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"This might be due to:\n"
                 f"• Network connectivity issues\n"
                 f"• Model loading problems\n"
-                f"• Image format issues\n\n"
+                f"• Image format issues\n"
+                f"• Server resource constraints\n\n"
                 f"Please try again later or with a different image."
             )
             await update.message.reply_text(error_msg, parse_mode='Markdown')
             return
             
         ai_probability = result["ai_probability"]
+        processing_time = result.get("processing_time", 0)
         
         # Determine verdict with confidence levels
         if ai_probability > 0.85:
@@ -222,7 +265,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"• Real Photo: {(1-ai_probability):.1%}\n"
             f"• AI-Generated: {ai_probability:.1%}\n\n"
             f"🔧 **Model:** {result.get('model_used', 'Unknown')}\n"
-          
+            f"⏱️ **Processing Time:** {processing_time:.2f}s\n\n"
+            f"💡 **Note:** Results are estimates and may not be 100% accurate."
         )
         
         await update.message.reply_text(response_text, parse_mode='Markdown')
@@ -233,35 +277,48 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "❌ **Processing Error**\n\n"
             "Failed to analyze the image. Please try:\n"
             "• A different image format (JPG/PNG)\n"
-            "• A smaller file size\n"
-            "• Waiting a moment and trying again"
+            "• A smaller file size (< 5MB)\n"
+            "• Waiting a moment and trying again\n"
+            "• Using /status to check bot health"
         )
         
     finally:
         # Clean up temporary file
-        if image_path and os.path.exists(image_path):
+        if temp_file and os.path.exists(temp_path):
             try:
-                os.remove(image_path)
-            except:
-                pass
+                os.remove(temp_path)
+            except Exception as cleanup_error:
+                logger.warning(f"Failed to cleanup temp file: {cleanup_error}")
 
 async def handle_non_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle non-photo messages"""
     await update.message.reply_text(
         "📷 **Send me an image to analyze!**\n\n"
         "I can detect AI-generated images from:\n"
         "• DALL-E, Midjourney, Stable Diffusion\n"
         "• Modern AI art generators\n"
         "• Digital art vs photographs\n\n"
-        "💡 Tip: Higher resolution images work better!"
+        "💡 **Tips for best results:**\n"
+        "• Use clear, uncompressed images\n"
+        "• File size under 5MB works best\n"
+        "• JPG and PNG formats supported\n\n"
+        "Use /info for more details!"
     )
 
 async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    model_info = f"**Model:** {detector.model_name}\n**Status:** {'🟢 Active' if detector.classifier else '🔴 Unavailable'}" if detector.model_name else "**Model:** Not loaded\n**Status:** 🔴 Limited functionality"
+    """Handle /info command"""
+    model_info = (
+        f"**Model:** {detector.model_name}\n"
+        f"**Status:** {'🟢 Active' if detector.classifier else '🔴 Unavailable'}"
+        if detector.model_name 
+        else "**Model:** Not loaded\n**Status:** 🔴 Limited functionality"
+    )
     
     info_text = (
         "ℹ️ **Bot Information**\n\n"
         f"{model_info}\n"
-        "**Platform:** Hugging Face 🤗\n\n"
+        "**Platform:** Hugging Face 🤗\n"
+        "**Processing:** CPU-optimized\n\n"
         "**What I can detect:**\n"
         "• AI-generated artwork\n"
         "• Synthetic images\n"
@@ -270,24 +327,35 @@ async def info_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**Tips for best results:**\n"
         "• Use high-resolution images\n"
         "• Avoid heavily compressed images\n"
-        "• Clear, unambiguous images work best\n\n"
+        "• Clear, unambiguous images work best\n"
+        "• File size under 5MB\n\n"
+        "**Commands:**\n"
+        "• /start - Welcome message\n"
+        "• /info - This information\n"
+        "• /status - Bot health check\n\n"
         "**Limitations:**\n"
-        "• Results are not 100% accurate\n"
+        "• Results are estimates, not 100% accurate\n"
         "• May struggle with edge cases\n"
-        "• Performance depends on model availability"
+        "• Performance depends on server resources\n"
+        "• Processing time varies with image size"
     )
     await update.message.reply_text(info_text, parse_mode='Markdown')
 
 def main():
+    """Main function to run the bot"""
     logger.info("🚀 Starting AI Detection Bot...")
     
+    if not BOT_TOKEN:
+        logger.error("❌ TELEGRAM_TOKEN environment variable not found!")
+        return
+    
     try:
-        # Create application
+        # Create application with optimized settings for cloud deployment
         app = (
             ApplicationBuilder()
             .token(BOT_TOKEN)
-            .read_timeout(60)
-            .write_timeout(60)
+            .read_timeout(120)
+            .write_timeout(120)
             .connect_timeout(60)
             .pool_timeout(60)
             .build()
@@ -296,24 +364,27 @@ def main():
         # Add handlers
         app.add_handler(CommandHandler("start", start))
         app.add_handler(CommandHandler("info", info_command))
+        app.add_handler(CommandHandler("status", status_command))
         app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
         app.add_handler(MessageHandler(~filters.PHOTO, handle_non_photo))
         
         logger.info("✅ Bot handlers registered!")
+        logger.info("🤖 Bot is ready to detect AI images!")
         logger.info("Press Ctrl+C to stop")
         
-        # Start polling
+        # Start polling with error handling
         app.run_polling(
             drop_pending_updates=True,
-            timeout=30,
-            bootstrap_retries=3
+            timeout=60,
+            bootstrap_retries=5,
+            close_loop=False
         )
         
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("🛑 Bot stopped by user")
     except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        logger.info("Bot stopped. Please check the error and restart manually.")
+        logger.error(f"💥 Fatal error: {e}")
+        logger.info("🔄 Bot stopped. Please check the error and restart manually.")
 
 if __name__ == "__main__":
     main()
